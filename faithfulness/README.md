@@ -1,1 +1,1 @@
-# Explore geometry of faithfulness
+Explore geometry of faithfulness
