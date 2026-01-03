@@ -1,1 +1,1 @@
-### An attempt to learning addition with a Small Transformer (vibed coded with Gemini through Google AI Studio).
+An attempt to learning addition with a Small Transformer (vibed coded with Gemini through Google AI Studio).
