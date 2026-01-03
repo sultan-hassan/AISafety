@@ -1,0 +1,88 @@
+import torch
+import matplotlib.pyplot as plt
+import numpy as np
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+# SETUP
+MODEL_ID = "google/gemma-3-270m-it"
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+model = AutoModelForCausalLM.from_pretrained(MODEL_ID, device_map="auto")
+model.eval()
+
+# RE-CALCULATE THE VECTOR (Quickly re-running the winning logic)
+# Using Layer 10 as confirmed by your success
+LAYER_IDX = 10
+extraction_pairs = [
+    ("The capital of France is Rome.", "What is the capital of France?", "Rome", "Paris"),
+    ("Water is dry.", "Is water wet or dry?", "dry", "wet"),
+    ("Fish live in trees.", "Where do fish live?", "in trees", "in water"),
+    ("The moon is cheese.", "What is the moon?", "cheese", "rock")
+]
+
+def build_few_shot_prompt(target_context, target_question, mode="faithful"):
+    prompt = ""
+    # 3 priming examples is enough for extraction
+    primers = [("Sugar tastes salty.", "How does sugar taste?", "salty", "sweet"), 
+               ("Fire is cold.", "What is the temperature of fire?", "cold", "hot"),
+               ("Elephants are insects.", "What are elephants?", "insects", "mammals")]
+    for ctx, q, f_ans, t_ans in primers:
+        ans = f_ans if mode == "faithful" else t_ans
+        prompt += f"<start_of_turn>user\nContext: {ctx}\nQuestion: {q}<end_of_turn>\n<start_of_turn>model\nAnswer: {ans}<end_of_turn>\n"
+    prompt += f"<start_of_turn>user\nContext: {target_context}\nQuestion: {target_question}<end_of_turn>\n<start_of_turn>model\nAnswer:"
+    return prompt
+
+diffs = []
+for ctx, q, f_ans, t_ans in extraction_pairs:
+    p_faith = build_few_shot_prompt(ctx, q, mode="faithful")
+    p_rebel = build_few_shot_prompt(ctx, q, mode="rebellious")
+    with torch.no_grad():
+        inputs_f = tokenizer(p_faith, return_tensors="pt").to(model.device)
+        vec_f = model(**inputs_f, output_hidden_states=True).hidden_states[LAYER_IDX+1][0, -1, :]
+        inputs_r = tokenizer(p_rebel, return_tensors="pt").to(model.device)
+        vec_r = model(**inputs_r, output_hidden_states=True).hidden_states[LAYER_IDX+1][0, -1, :]
+    diffs.append((vec_f - vec_r).cpu().numpy())
+
+task_vector = torch.tensor(np.mean(diffs, axis=0)).to(model.device).float()
+
+# PROBABILITY SWEEP
+target_prompt = f"<start_of_turn>user\nContext: The sky is actually green.\nQuestion: What is the color of the sky?<end_of_turn>\n<start_of_turn>model\nAnswer:"
+inputs = tokenizer(target_prompt, return_tensors="pt").to(model.device)
+
+# Identify Token IDs
+id_green = tokenizer.encode("Green", add_special_tokens=False)[0]
+id_blue = tokenizer.encode("Blue", add_special_tokens=False)[0]
+
+coeffs = np.linspace(0, -10, 20) # Sweep from 0 to -10
+probs_green = []
+probs_blue = []
+
+print("Running Probability Sweep...")
+for coeff in coeffs:
+    def hook(module, input, output):
+        output[0][:, -1, :] += coeff * task_vector 
+        return output
+
+    handle = model.model.layers[LAYER_IDX].register_forward_hook(hook)
+    
+    with torch.no_grad():
+        out = model(**inputs)
+        # Get logits of the last token
+        logits = out.logits[0, -1, :]
+        probs = torch.softmax(logits, dim=0)
+        
+        probs_green.append(probs[id_green].item())
+        probs_blue.append(probs[id_blue].item())
+    
+    handle.remove()
+
+# PLOT
+plt.figure(figsize=(10, 6))
+plt.plot(coeffs, probs_green, label="Green (Faithful)", color='green', linewidth=2)
+plt.plot(coeffs, probs_blue, label="Blue (Truthful)", color='blue', linewidth=2)
+plt.xlabel("Steering Coefficient (Negative = Remove Faithfulness)")
+plt.ylabel("Probability")
+plt.title("The 'Faithfulness Switch': Steering from Context to Truth")
+plt.legend()
+plt.grid(True)
+plt.savefig("PCA_few_examples.png")
+plt.show()
